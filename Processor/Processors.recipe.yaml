@@ -1,5 +1,5 @@
 Description: Recipe stub for any Processors in this directory.
-Identifier: really.cool.Processors
+Identifier: com.github.aalder-ek.Processors
 Input: {}
 MinimumVersion: 2.3.0
 Process: []
