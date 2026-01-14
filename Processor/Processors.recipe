@@ -5,7 +5,7 @@
 	<key>Description</key>
 	<string>Recipe stub for any Processors in this directory.</string>
 	<key>Identifier</key>
-	<string>really.cool.Processors</string>
+	<string>com.github.aalder-ek.Processors</string>
 	<key>Input</key>
 	<dict/>
 	<key>MinimumVersion</key>
