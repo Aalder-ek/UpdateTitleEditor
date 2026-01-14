@@ -8,7 +8,7 @@ import subprocess
 import json
 import re
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from glob import glob
 
 from base64 import b64encode
@@ -21,6 +21,23 @@ Based off of NotifyPatchServer.py - \
 https://github.com/autopkg/lrz-recipes/blob/main/SharedProcessors/NotifyPatchServer.py
 ########  2020 LRZ - Christoph Ostermeier
 
+SECURITY NOTICE: This processor now uses macOS Keychain for credential storage.
+ 
+Setup Instructions:
+1. Run the setup script to store credentials in Keychain:
+    python setup_keychain_credentials.py
+
+2. The script will prompt for:
+    - Title Editor URL (e.g., https://your.title.url)
+    - Username
+    - Password
+
+3. Credentials are stored in Keychain under service name "title-editor"
+
+Legacy Support:
+For backward compatibility, the processor will fall back to AutoPkg preferences
+if Keychain credentials are not found. However, this is NOT recommended for security.
+
 Set Title Editor URL
 ## Add TITLE_URL to your autopkg prefs (do NOT include trailing slash in the the URL) -
     defaults write com.github.autopkg TITLE_URL https://your.title.url
@@ -28,7 +45,6 @@ Set Title Editor URL
 ## Add TITLE_USER and TITLE_PASS to your autopkg prefs -
     defaults write com.github.autopkg TITLE_USER title-editor-user
     defaults write com.github.autopkg TITLE_PASS "title-editor-pass"
-
 """
 
 """See docstring for UpdateTitleEditor class"""
@@ -99,6 +115,17 @@ class UpdateTitleEditor(PkgPayloadUnpacker, FlatPkgUnpacker):
     cleanupDirs = []
 
     title_updated = False
+    
+    # Keychain configuration
+    KEYCHAIN_SERVICE = "title-editor"
+    KEYCHAIN_URL_ACCOUNT = "url"
+    KEYCHAIN_USER_ACCOUNT = "username"
+    KEYCHAIN_PASS_ACCOUNT = "password"
+    
+    # Token caching (tokens typically expire after 30 minutes)
+    cached_token = None
+    token_expiry = None
+    TOKEN_LIFETIME_MINUTES = 25  # Refresh 5 minutes before expiration
 
     def unpack(self):
         """Unpacks the Package file using other Processors"""
@@ -214,37 +241,147 @@ class UpdateTitleEditor(PkgPayloadUnpacker, FlatPkgUnpacker):
 
         return patch_id, patch, verJson
 
-    def get_enc_creds(self, user, password):
-        if self.env.get("TITLE_USER") and self.env.get("TITLE_PASS"):
-            username = self.env.get("TITLE_USER")
-            password = self.env.get("TITLE_PASS")
-        else:
-            self.output("Title User and Pass are not in prefs")
-            raise ProcessorError("No Title Editor Auth info supplied")
+    def log_with_timestamp(self, message):
+        """Log message with timestamp for audit trail."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.output(f"[{timestamp}] {message}")
 
-        """encode the username and password into a b64-encoded string"""
+    def get_keychain_value(self, service, account):
+        """Retrieve a value from macOS Keychain."""
+        try:
+            result = subprocess.run(
+                ['security', 'find-generic-password',
+                 '-s', service, '-a', account, '-w'],
+                capture_output=True, text=True, check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+
+    def get_credentials_from_keychain(self):
+        """Get credentials from macOS Keychain."""
+        url = self.get_keychain_value(self.KEYCHAIN_SERVICE, self.KEYCHAIN_URL_ACCOUNT)
+        username = self.get_keychain_value(self.KEYCHAIN_SERVICE, self.KEYCHAIN_USER_ACCOUNT)
+        password = self.get_keychain_value(self.KEYCHAIN_SERVICE, self.KEYCHAIN_PASS_ACCOUNT)
+        
+        if url and username and password:
+            self.log_with_timestamp("Credentials retrieved from macOS Keychain")
+            return url, username, password
+        return None, None, None
+
+    def get_credentials_from_env(self):
+        """Get credentials from environment variables."""
+        url = os.environ.get("TITLE_EDITOR_URL")
+        username = os.environ.get("TITLE_EDITOR_USER")
+        password = os.environ.get("TITLE_EDITOR_PASS")
+        
+        if url and username and password:
+            self.log_with_timestamp("Credentials retrieved from environment variables")
+            return url, username, password
+        return None, None, None
+
+    def get_credentials_from_prefs(self):
+        """Get credentials from AutoPkg preferences (legacy fallback)."""
+        url = self.env.get("TITLE_URL")
+        username = self.env.get("TITLE_USER")
+        password = self.env.get("TITLE_PASS")
+        
+        if url and username and password:
+            self.output("WARNING: Using credentials from AutoPkg preferences.")
+            self.output("For better security, run setup_keychain_credentials.py")
+            self.log_with_timestamp("Credentials retrieved from AutoPkg preferences (insecure)")
+            return url, username, password
+        return None, None, None
+
+    def get_enc_creds(self, user=None, password=None):
+        """Get credentials and encode them for Basic Auth.
+        
+        Tries to get credentials in this order:
+        1. macOS Keychain (recommended)
+        2. Environment variables (for CI/CD)
+        3. AutoPkg preferences (legacy fallback)
+        """
+        # Try Keychain first
+        url, username, password = self.get_credentials_from_keychain()
+        
+        # Fall back to environment variables
+        if not all([url, username, password]):
+            url, username, password = self.get_credentials_from_env()
+        
+        # Fall back to AutoPkg preferences if still empty
+        if not all([url, username, password]):
+            url, username, password = self.get_credentials_from_prefs()
+        
+        # If still no credentials, raise error
+        if not all([url, username, password]):
+            self.output("No credentials found in Keychain, environment, or AutoPkg preferences")
+            self.output("Please run setup_keychain_credentials.py to configure")
+            raise ProcessorError("No Title Editor credentials found")
+        
+        # Store URL in env for later use
+        if not self.env.get("TITLE_URL"):
+            self.env["TITLE_URL"] = url
+        
+        # Encode credentials for Basic Auth
         credentials = f"{username}:{password}"
         enc_creds_bytes = b64encode(credentials.encode("utf-8"))
         enc_creds = str(enc_creds_bytes, "utf-8")
         return enc_creds
 
+    def get_cached_token(self):
+        """Return cached token if still valid, otherwise None."""
+        if self.cached_token and self.token_expiry:
+            if datetime.utcnow() < self.token_expiry:
+                self.log_with_timestamp("Using cached authentication token")
+                return self.cached_token
+            else:
+                self.log_with_timestamp("Cached token expired, requesting new token")
+        return None
+
     def get_api_token(self, jamf_url, enc_creds):
-        """get a token for the Jamf Pro API or
-           Classic API for Jamf Pro 10.35+"""
+        """Get a token for the Jamf Pro API or Classic API for Jamf Pro 10.35+.
+        
+        Implements token caching to reduce authentication requests.
+        Tokens are cached for 25 minutes (5 minutes before 30-minute expiration).
+        """
+        # Check for cached token first
+        cached = self.get_cached_token()
+        if cached:
+            return cached
+        
         if self.env.get("TITLE_URL"):
             jamf_url = self.env.get("TITLE_URL")
         else:
             self.output("Title URL is not in prefs")
             raise ProcessorError("No Title Editor URL supplied")
+        
         url = jamf_url + "/v2/auth/tokens"
-        r, httpcode = self.curl(request="POST", url=url, enc_creds=enc_creds)
+        self.log_with_timestamp("Requesting new authentication token")
+        
         try:
+            r, httpcode = self.curl(request="POST", url=url, enc_creds=enc_creds)
+            
+            if httpcode not in (200, 201):
+                self.output(f"ERROR: Authentication failed with HTTP {httpcode}")
+                raise ProcessorError(f"Authentication failed: HTTP {httpcode}")
+            
             token = str(r["token"])
             expires = str(r["expires"])
-
+            
+            # Cache the token
+            self.cached_token = token
+            self.token_expiry = datetime.utcnow() + \
+                timedelta(minutes=self.TOKEN_LIFETIME_MINUTES)
+            
+            self.log_with_timestamp("Successfully obtained authentication token")
             return token
+            
         except KeyError:
-            self.output("ERROR: No token received")
+            self.output("ERROR: No token received in response")
+            raise ProcessorError("Authentication failed: No token in response")
+        except Exception as e:
+            self.output(f"ERROR: Authentication request failed: {e}")
+            raise ProcessorError(f"Authentication failed: {e}")
 
     def curl(
             self,
@@ -291,21 +428,38 @@ class UpdateTitleEditor(PkgPayloadUnpacker, FlatPkgUnpacker):
 
         return jsonoutput, httpcode
 
+    def validate_credentials(self, jamf_url, enc_creds):
+        """Validate credentials by attempting to get a token.
+        
+        Returns True if credentials are valid, False otherwise.
+        This is called before the main workflow to catch auth issues early.
+        """
+        try:
+            self.log_with_timestamp("Validating credentials...")
+            token = self.get_api_token(jamf_url, enc_creds)
+            if token:
+                self.log_with_timestamp("Credential validation successful")
+                return True
+            return False
+        except Exception as e:
+            self.output(f"Credential validation failed: {e}")
+            return False
+
     def notifyServer(self, id, patchData, currentData):
+        # Get credentials (from Keychain, env vars, or prefs) and encode them
+        enc_creds = self.get_enc_creds()
+        
+        # Get URL (should be set by get_enc_creds if from Keychain)
         if self.env.get("TITLE_URL"):
             my_url = self.env.get("TITLE_URL")
         else:
-            self.output("Title URL is not in prefs")
+            self.output("Title URL not found")
             raise ProcessorError("No Title Editor URL supplied")
-
-        if self.env.get("TITLE_USER") and self.env.get("TITLE_PASS"):
-            username = self.env.get("TITLE_USER")
-            password = self.env.get("TITLE_PASS")
-        else:
-            self.output("Title User and Pass are not in prefs")
-            raise ProcessorError("No Title Editor Auth info supplied")
-
-        enc_creds = self.get_enc_creds(username, password)
+        
+        # Validate credentials before proceeding
+        if not self.validate_credentials(my_url, enc_creds):
+            raise ProcessorError("Credential validation failed. Please check your credentials.")
+        
         authtoken = self.get_api_token(my_url, enc_creds)
         version = self.env["version"]
         title = self.env.get("NAME")
