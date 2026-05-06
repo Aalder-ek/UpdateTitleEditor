@@ -514,6 +514,8 @@ class UpdateTitleEditor(PkgPayloadUnpacker, FlatPkgUnpacker):
         """Helper Function to unpack Payloads"""
         self.env["destination_path"] = os.path.join(self.env["RECIPE_CACHE_DIR"],
                                                     "UnpackedPayload")
+        if os.path.isdir(self.env["destination_path"]):
+            shutil.rmtree(self.env["destination_path"])
         self.cleanupDirs.append(self.env["destination_path"])
         self.output("Unpacking Payload to'%s'" % self.env["destination_path"])
         self.unpack_pkg_payload()
