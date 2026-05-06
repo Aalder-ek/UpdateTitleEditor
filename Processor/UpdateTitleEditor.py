@@ -503,6 +503,7 @@ class UpdateTitleEditor(PkgPayloadUnpacker, FlatPkgUnpacker):
         for directory in self.cleanupDirs:
             if os.path.isdir(directory):
                 shutil.rmtree(directory)
+        UpdateTitleEditor.cleanupDirs = []
 
     def main(self):
         app_path = self.unpack()
